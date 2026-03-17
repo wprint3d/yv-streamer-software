@@ -66,7 +66,8 @@ impl CameraConfig {
         let framerate = value_from_request(query, headers, "framerate", "x-framerate")
             .or_else(|| existing.map(|config| config.framerate.to_string()))
             .ok_or(CameraManagerError::MissingBootstrapField("framerate"))?
-            .parse::<u32>()
+            .parse::<f64>()
+            .map(|v| v as u32)
             .map_err(|_| CameraManagerError::InvalidBootstrapField("framerate"))?;
 
         let capture_encoding = value_from_request(
