@@ -526,10 +526,10 @@ fn yuyv_to_rgb(frame: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(frame.len() / 2 * 3);
 
     for chunk in frame.chunks_exact(4) {
-        let y0 = chunk[0] as f32;
-        let u = chunk[1] as f32 - 128.0;
-        let y1 = chunk[2] as f32;
-        let v = chunk[3] as f32 - 128.0;
+        let y0 = chunk[0] as i32;
+        let u  = chunk[1] as i32 - 128;
+        let y1 = chunk[2] as i32;
+        let v  = chunk[3] as i32 - 128;
 
         output.extend_from_slice(&yuv_to_rgb(y0, u, v));
         output.extend_from_slice(&yuv_to_rgb(y1, u, v));
@@ -538,16 +538,22 @@ fn yuyv_to_rgb(frame: &[u8]) -> Vec<u8> {
     output
 }
 
-fn yuv_to_rgb(y: f32, u: f32, v: f32) -> [u8; 3] {
-    let red = (y + 1.402 * v).round();
-    let green = (y - 0.344_136 * u - 0.714_136 * v).round();
-    let blue = (y + 1.772 * u).round();
+pub fn yuv_to_rgb(y: i32, u: i32, v: i32) -> [u8; 3] {
+    // Coefficients scaled by 2^16 (65536):
+    //   1.402    * 65536 = 91881
+    //   0.344136 * 65536 = 22554
+    //   0.714136 * 65536 = 46802
+    //   1.772    * 65536 = 116130
+    let y_fixed = y << 16;
+    let red   = (y_fixed + 91881 * v + 32768) >> 16;
+    let green = (y_fixed - 22554 * u - 46802 * v + 32768) >> 16;
+    let blue  = (y_fixed + 116130 * u + 32768) >> 16;
 
-    [clamp(red), clamp(green), clamp(blue)]
+    [clamp_u8(red), clamp_u8(green), clamp_u8(blue)]
 }
 
-fn clamp(channel: f32) -> u8 {
-    channel.clamp(0.0, 255.0) as u8
+fn clamp_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
 }
 
 fn encoding_to_fourcc(encoding: &str) -> Option<FourCC> {

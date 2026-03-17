@@ -131,4 +131,27 @@ mod tests {
         std::fs::remove_file(tempdir.join("not-a-camera")).unwrap();
         std::fs::remove_dir(&tempdir).unwrap();
     }
+
+    #[test]
+    fn integer_yuv_to_rgb_matches_reference_output() {
+        use crate::manager::yuv_to_rgb;
+
+        // Pure white: Y=255, U=0, V=0 (after -128 offset applied by caller)
+        assert_eq!(yuv_to_rgb(255, 0, 0), [255, 255, 255]);
+
+        // Pure black: Y=0, U=0, V=0
+        assert_eq!(yuv_to_rgb(0, 0, 0), [0, 0, 0]);
+
+        // Mid-gray: Y=128, U=0, V=0
+        assert_eq!(yuv_to_rgb(128, 0, 0), [128, 128, 128]);
+
+        // Red-ish: Y=128, U=-50, V=100
+        let rgb = yuv_to_rgb(128, -50, 100);
+        let ref_r = (128.0 + 1.402 * 100.0f32).round().clamp(0.0, 255.0) as u8;
+        let ref_g = (128.0 - 0.344136 * -50.0f32 - 0.714136 * 100.0).round().clamp(0.0, 255.0) as u8;
+        let ref_b = (128.0 + 1.772 * -50.0f32).round().clamp(0.0, 255.0) as u8;
+        assert!((rgb[0] as i16 - ref_r as i16).abs() <= 1, "red: {} vs {}", rgb[0], ref_r);
+        assert!((rgb[1] as i16 - ref_g as i16).abs() <= 1, "green: {} vs {}", rgb[1], ref_g);
+        assert!((rgb[2] as i16 - ref_b as i16).abs() <= 1, "blue: {} vs {}", rgb[2], ref_b);
+    }
 }
