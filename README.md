@@ -2,7 +2,7 @@
 
 `yv-streamer-software` is the software MJPEG fallback sidecar used by WPrint 3D for UVC cameras that expose raw formats such as `YUYV` instead of a browser-friendly MJPEG stream.
 
->Hey there, human here! So, uh... no, I haven't learned Rust yet. But I have a beatiful subscription to Codex and I wanted to give it a try. It works. I don't know why or how, but it does, and I don't care enough because this will run behind a bizillion layers of abstraction and containerization and will be thoroughly tested before it ever sees the light of day. So here we are. I hope this is helpful to someone, but if not, that's fine too. There's so many things I use and don't fully understand, whatever.
+>Hey there, human here! So, uh... no, I haven't learned Rust yet. But I have a beatiful subscription to Codex 5.4, Claude Sonnet 4.6, and Claude Opus 4.6, and I wanted to give them a try. It works. I don't know why or how, but it does, and I don't care enough because this will run behind a bizillion layers of abstraction and containerization and will be thoroughly tested before it ever sees the light of day. So here we are. I hope this is helpful to someone, but if not, that's fine too. There's so many things I use and don't fully understand, whatever.
 >
 >The code is readable enough and I moreso get the general architecture and approach, and that's enough in my books. If it DOES end up working as reliably as it seems to be, this might become a multi-standard streamer. In that case, it'll be renamed to something more generic, so stay tuned for that.
 >
