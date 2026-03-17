@@ -1,11 +1,11 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         Arc, RwLock,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -24,7 +24,7 @@ use v4l::{
     FourCC,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CameraConfig {
     pub camera_id: String,
     pub node: String,
@@ -32,7 +32,21 @@ pub struct CameraConfig {
     pub height: u32,
     pub framerate: u32,
     pub capture_encoding: String,
+    pub adaptive_quality: bool,
 }
+
+impl PartialEq for CameraConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.camera_id == other.camera_id
+            && self.node == other.node
+            && self.width == other.width
+            && self.height == other.height
+            && self.framerate == other.framerate
+            && self.capture_encoding == other.capture_encoding
+    }
+}
+
+impl Eq for CameraConfig {}
 
 impl CameraConfig {
     #[cfg(test)]
@@ -44,6 +58,7 @@ impl CameraConfig {
             height: 480,
             framerate: 30,
             capture_encoding: "YUYV".to_string(),
+            adaptive_quality: false,
         }
     }
 
@@ -80,6 +95,16 @@ impl CameraConfig {
         .ok_or(CameraManagerError::MissingBootstrapField("capture_encoding"))?
         .to_uppercase();
 
+        let adaptive_quality = value_from_request(
+            query,
+            headers,
+            "adaptive_quality",
+            "x-adaptive-quality",
+        )
+        .or_else(|| existing.map(|config| config.adaptive_quality.to_string()))
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
         Ok(Self {
             camera_id: camera_id.to_string(),
             node,
@@ -87,6 +112,7 @@ impl CameraConfig {
             height,
             framerate,
             capture_encoding,
+            adaptive_quality,
         })
     }
 }
@@ -99,18 +125,39 @@ pub struct CameraStateSnapshot {
     pub height: u32,
     pub framerate: u32,
     pub capture_encoding: String,
+    pub adaptive_quality: bool,
+    pub current_jpeg_quality: u8,
     pub status: String,
     pub frames_captured: u64,
     pub last_frame_at_ms: Option<u128>,
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CameraManager {
     workers: Arc<RwLock<HashMap<String, Arc<CameraWorker>>>>,
+    cleanup_sender: std::sync::mpsc::Sender<String>,
 }
 
 impl CameraManager {
+    pub fn new() -> (Self, std::sync::mpsc::Receiver<String>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let manager = Self {
+            workers: Arc::new(RwLock::new(HashMap::new())),
+            cleanup_sender: sender,
+        };
+        (manager, receiver)
+    }
+
+    #[cfg(test)]
+    pub fn test_new() -> Self {
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        Self {
+            workers: Arc::new(RwLock::new(HashMap::new())),
+            cleanup_sender: sender,
+        }
+    }
+
     pub fn ensure_camera(
         &self,
         camera_id: &str,
@@ -139,6 +186,7 @@ impl CameraManager {
 
         if let Some(worker) = current {
             if worker.config() == &config {
+                worker.set_adaptive_quality(config.adaptive_quality);
                 debug!("Reusing existing worker for camera {}", camera_id);
                 return Ok(worker);
             }
@@ -155,7 +203,7 @@ impl CameraManager {
             worker.stop();
         }
 
-        let worker = CameraWorker::spawn_live(config)?;
+        let worker = CameraWorker::spawn_live(config, self.cleanup_sender.clone())?;
 
         self.workers
             .write()
@@ -217,6 +265,14 @@ impl CameraManager {
         camera_ids
     }
 
+    pub fn remove_worker(&self, camera_id: &str) {
+        self.workers
+            .write()
+            .expect("camera worker write lock poisoned")
+            .remove(camera_id);
+        debug!("Removed idle worker for camera {}; managed cameras: {:?}", camera_id, self.active_camera_ids());
+    }
+
     pub fn register_static_frame(&self, config: CameraConfig, frame: Vec<u8>) {
         let worker = CameraWorker::from_static_frame(config, frame);
         let camera_id = worker.config().camera_id.clone();
@@ -268,11 +324,18 @@ pub struct CameraWorker {
     latest_frame: watch::Sender<Bytes>,
     stop: Arc<AtomicBool>,
     frame_count: AtomicU64,
+    frame_consumed: Arc<AtomicBool>,
+    adaptive_quality: Arc<AtomicBool>,
+    current_quality: Arc<AtomicU8>,
+    cleanup_sender: Option<std::sync::mpsc::Sender<String>>,
     state: Arc<RwLock<CameraWorkerState>>,
 }
 
 impl CameraWorker {
-    fn spawn_live(config: CameraConfig) -> Result<Arc<Self>, CameraManagerError> {
+    fn spawn_live(
+        config: CameraConfig,
+        cleanup_sender: std::sync::mpsc::Sender<String>,
+    ) -> Result<Arc<Self>, CameraManagerError> {
         if !matches!(config.capture_encoding.as_str(), "YUYV" | "MJPG") {
             return Err(CameraManagerError::UnsupportedCaptureEncoding(
                 config.capture_encoding.clone(),
@@ -291,10 +354,14 @@ impl CameraWorker {
 
         let (latest_frame, _) = watch::channel(Bytes::new());
         let worker = Arc::new(Self {
+            adaptive_quality: Arc::new(AtomicBool::new(config.adaptive_quality)),
             config,
             latest_frame,
             stop: Arc::new(AtomicBool::new(false)),
             frame_count: AtomicU64::new(0),
+            frame_consumed: Arc::new(AtomicBool::new(true)),
+            current_quality: Arc::new(AtomicU8::new(80)),
+            cleanup_sender: Some(cleanup_sender),
             state: Arc::new(RwLock::new(CameraWorkerState {
                 status: "starting".to_string(),
                 last_error: None,
@@ -313,13 +380,19 @@ impl CameraWorker {
         Ok(worker)
     }
 
+    // Static-frame workers are only used by test helpers (register_static_frame).
+    // They never enter the capture loop, so cleanup_sender: None is intentional.
     fn from_static_frame(config: CameraConfig, frame: Vec<u8>) -> Self {
         let (latest_frame, _) = watch::channel(Bytes::from(frame));
         Self {
+            adaptive_quality: Arc::new(AtomicBool::new(config.adaptive_quality)),
             config,
             latest_frame,
             stop: Arc::new(AtomicBool::new(false)),
             frame_count: AtomicU64::new(1),
+            frame_consumed: Arc::new(AtomicBool::new(true)),
+            current_quality: Arc::new(AtomicU8::new(80)),
+            cleanup_sender: None,
             state: Arc::new(RwLock::new(CameraWorkerState {
                 status: "ready".to_string(),
                 last_error: None,
@@ -328,8 +401,8 @@ impl CameraWorker {
         }
     }
 
-    pub fn subscribe(&self) -> watch::Receiver<Bytes> {
-        self.latest_frame.subscribe()
+    pub fn subscribe(&self) -> (watch::Receiver<Bytes>, Arc<AtomicBool>) {
+        (self.latest_frame.subscribe(), self.frame_consumed.clone())
     }
 
     pub fn current_frame(&self) -> Bytes {
@@ -338,6 +411,10 @@ impl CameraWorker {
 
     pub fn config(&self) -> &CameraConfig {
         &self.config
+    }
+
+    pub fn set_adaptive_quality(&self, enabled: bool) {
+        self.adaptive_quality.store(enabled, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> CameraStateSnapshot {
@@ -350,6 +427,8 @@ impl CameraWorker {
             height: self.config.height,
             framerate: self.config.framerate,
             capture_encoding: self.config.capture_encoding.clone(),
+            adaptive_quality: self.adaptive_quality.load(Ordering::Relaxed),
+            current_jpeg_quality: self.current_quality.load(Ordering::Relaxed),
             status: state.status.clone(),
             frames_captured: self.frame_count.load(Ordering::Relaxed),
             last_frame_at_ms: state.last_frame_at_ms,
@@ -378,6 +457,7 @@ impl CameraWorker {
 
     fn publish_frame(&self, frame: Bytes) {
         let _ = self.latest_frame.send(frame);
+        self.frame_consumed.store(false, Ordering::Relaxed);
         let frame_count = self.frame_count.fetch_add(1, Ordering::Relaxed) + 1;
 
         if let Ok(mut state) = self.state.write() {
@@ -407,7 +487,51 @@ impl CameraWorker {
             self.config.node
         );
 
+        let idle_timeout = Duration::from_secs(30);
+        let mut had_subscriber = false;
+
         while !self.stop.load(Ordering::Relaxed) {
+            if self.latest_frame.receiver_count() > 0 {
+                had_subscriber = true;
+            }
+
+            if had_subscriber && self.latest_frame.receiver_count() == 0 {
+                let idle_start = Instant::now();
+                info!(
+                    "Camera {} has no subscribers, starting 30s idle grace period",
+                    self.config.camera_id
+                );
+
+                loop {
+                    thread::sleep(Duration::from_millis(250));
+
+                    if self.stop.load(Ordering::Relaxed) {
+                        debug!("Camera {} capture loop stopped (explicit stop during idle)", self.config.camera_id);
+                        return;
+                    }
+
+                    if self.latest_frame.receiver_count() > 0 {
+                        had_subscriber = true;
+                        debug!(
+                            "Camera {} subscriber reconnected during grace period",
+                            self.config.camera_id
+                        );
+                        break;
+                    }
+
+                    if idle_start.elapsed() >= idle_timeout {
+                        info!(
+                            "Camera {} idle timeout reached (30s), shutting down capture thread",
+                            self.config.camera_id
+                        );
+                        if let Some(sender) = &self.cleanup_sender {
+                            let _ = sender.send(self.config.camera_id.clone());
+                        }
+                        return;
+                    }
+                }
+            }
+
             match self.capture_once() {
                 Ok(()) => {}
                 Err(error) => {
@@ -476,15 +600,90 @@ impl CameraWorker {
             self.config.camera_id
         );
 
+        let frame_budget = Duration::from_millis(1000 / self.config.framerate.max(1) as u64);
+        let mut quality: u8 = 80;
+        let mut consecutive_direction: i8 = 0;
+        let mut consecutive_count: u8 = 0;
+        let mut skipped_frames: u64 = 0;
+
         while !self.stop.load(Ordering::Relaxed) {
+            if self.latest_frame.receiver_count() == 0 {
+                debug!("Camera {} lost all subscribers during streaming, breaking to idle check", self.config.camera_id);
+                break;
+            }
+
             let (frame, _) = stream.next().map_err(|error| error.to_string())?;
+
+            if !self.frame_consumed.load(Ordering::Relaxed) {
+                skipped_frames += 1;
+                if skipped_frames % 300 == 0 {
+                    debug!(
+                        "Camera {} has skipped {} frames (unconsumed)",
+                        self.config.camera_id, skipped_frames
+                    );
+                }
+                continue;
+            }
+
+            let encode_start = Instant::now();
+            let active_quality = if self.adaptive_quality.load(Ordering::Relaxed) {
+                quality
+            } else {
+                80
+            };
+
             let jpeg = encode_frame_to_jpeg(
                 frame,
                 self.config.width,
                 self.config.height,
                 &self.config.capture_encoding,
+                active_quality,
             )
             .map_err(|error| error.to_string())?;
+
+            let encode_duration = encode_start.elapsed();
+
+            if self.adaptive_quality.load(Ordering::Relaxed) {
+                let ratio = encode_duration.as_secs_f64() / frame_budget.as_secs_f64();
+                let direction: i8 = if ratio > 0.70 {
+                    -1
+                } else if ratio < 0.40 {
+                    1
+                } else {
+                    0
+                };
+
+                if direction == 0 || direction != consecutive_direction {
+                    consecutive_direction = direction;
+                    consecutive_count = if direction == 0 { 0 } else { 1 };
+                } else {
+                    consecutive_count += 1;
+                }
+
+                if consecutive_count >= 3 {
+                    let old_quality = quality;
+                    if direction < 0 {
+                        quality = quality.saturating_sub(5).max(30);
+                    } else {
+                        quality = (quality + 5).min(80);
+                    }
+                    if quality != old_quality {
+                        debug!(
+                            "Camera {} adaptive quality: {} -> {} (encode ratio {:.1}%)",
+                            self.config.camera_id, old_quality, quality,
+                            ratio * 100.0
+                        );
+                    }
+                    consecutive_count = 0;
+                }
+
+                self.current_quality.store(quality, Ordering::Relaxed);
+            } else {
+                quality = 80;
+                consecutive_count = 0;
+                consecutive_direction = 0;
+                self.current_quality.store(80, Ordering::Relaxed);
+            }
 
             self.publish_frame(Bytes::from(jpeg));
         }
@@ -508,13 +707,14 @@ fn encode_frame_to_jpeg(
     width: u32,
     height: u32,
     capture_encoding: &str,
+    quality: u8,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     match capture_encoding {
         "MJPG" => Ok(frame.to_vec()),
         "YUYV" => {
             let rgb = yuyv_to_rgb(frame);
             let mut output = Vec::new();
-            let encoder = Encoder::new(&mut output, 80);
+            let encoder = Encoder::new(&mut output, quality);
             encoder.encode(&rgb, width as u16, height as u16, ColorType::Rgb)?;
             Ok(output)
         }

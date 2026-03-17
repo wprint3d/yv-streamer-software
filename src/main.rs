@@ -42,7 +42,18 @@ async fn main() {
         .await
         .expect("failed to bind listener");
 
-    let manager = CameraManager::default();
+    let (manager, cleanup_receiver) = CameraManager::new();
+
+    // Drain task: when a capture thread shuts down (idle timeout), it sends
+    // its camera_id through the cleanup channel.  This blocking recv runs
+    // inside spawn_blocking so it doesn't starve the tokio runtime.
+    let drain_manager = manager.clone();
+    tokio::task::spawn_blocking(move || {
+        while let Ok(camera_id) = cleanup_receiver.recv() {
+            tracing::info!("Cleanup: removing idle worker for camera {}", camera_id);
+            drain_manager.remove_worker(&camera_id);
+        }
+    });
 
     if startup::should_emit_debug_boot_report(&log_filter) {
         startup::log_debug_boot_report(&manager, &host, port);

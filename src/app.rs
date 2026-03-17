@@ -1,4 +1,4 @@
-use std::{collections::HashMap, convert::Infallible};
+use std::{collections::HashMap, convert::Infallible, sync::{atomic::{AtomicBool, Ordering}, Arc}};
 
 use async_stream::stream;
 use axum::{
@@ -68,7 +68,10 @@ async fn internal_stream(
     headers: HeaderMap,
 ) -> Response {
     match manager.ensure_or_get_existing(&camera_id, &query, &headers) {
-        Ok(worker) => mjpeg_stream_response(worker.subscribe()),
+        Ok(worker) => {
+            let (receiver, frame_consumed) = worker.subscribe();
+            mjpeg_stream_response(receiver, frame_consumed)
+        }
         Err(error) => error_response(error),
     }
 }
@@ -122,10 +125,11 @@ fn jpeg_response(frame: Bytes) -> Response {
     response
 }
 
-fn mjpeg_stream_response(mut receiver: tokio::sync::watch::Receiver<Bytes>) -> Response {
+fn mjpeg_stream_response(mut receiver: tokio::sync::watch::Receiver<Bytes>, frame_consumed: Arc<AtomicBool>) -> Response {
     let body_stream = stream! {
         let initial = receiver.borrow().clone();
         if !initial.is_empty() {
+            frame_consumed.store(true, Ordering::Relaxed);
             yield Ok::<Bytes, Infallible>(build_mjpeg_chunk(&initial));
         }
 
@@ -136,6 +140,7 @@ fn mjpeg_stream_response(mut receiver: tokio::sync::watch::Receiver<Bytes>) -> R
                 continue;
             }
 
+            frame_consumed.store(true, Ordering::Relaxed);
             yield Ok::<Bytes, Infallible>(build_mjpeg_chunk(&frame));
         }
     };

@@ -17,7 +17,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint_reports_ok() {
-        let manager = CameraManager::default();
+        let manager = CameraManager::test_new();
         let app = build_router(manager);
 
         let response = app
@@ -30,7 +30,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_and_compatibility_endpoints_expose_registered_camera_frames() {
-        let manager = CameraManager::default();
+        let manager = CameraManager::test_new();
         manager.register_static_frame(CameraConfig::test("cam-1"), vec![1, 2, 3, 4]);
         let app = build_router(manager);
 
@@ -53,7 +53,7 @@ mod tests {
 
     #[tokio::test]
     async fn mjpeg_stream_endpoints_return_multipart_responses() {
-        let manager = CameraManager::default();
+        let manager = CameraManager::test_new();
         manager.register_static_frame(CameraConfig::test("cam-1"), vec![1, 2, 3, 4]);
         let app = build_router(manager);
 
@@ -130,6 +130,20 @@ mod tests {
         std::fs::remove_file(tempdir.join("video0")).unwrap();
         std::fs::remove_file(tempdir.join("not-a-camera")).unwrap();
         std::fs::remove_dir(&tempdir).unwrap();
+    }
+
+    #[test]
+    fn camera_config_equality_ignores_adaptive_quality() {
+        let mut a = CameraConfig::test("cam-1");
+        let mut b = CameraConfig::test("cam-1");
+
+        a.adaptive_quality = false;
+        b.adaptive_quality = true;
+        assert_eq!(a, b, "adaptive_quality should be excluded from equality");
+
+        // Verify other fields ARE included
+        b.framerate = 15;
+        assert_ne!(a, b, "framerate change should make configs unequal");
     }
 
     #[test]
