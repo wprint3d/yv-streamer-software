@@ -186,7 +186,11 @@ impl CameraManager {
 
         if let Some(worker) = current {
             if worker.config() == &config {
-                worker.set_adaptive_quality(config.adaptive_quality);
+                // Only update adaptive_quality if the request explicitly included it;
+                // otherwise, preserve the current runtime value.
+                if has_adaptive_quality(query, headers) {
+                    worker.set_adaptive_quality(config.adaptive_quality);
+                }
                 debug!("Reusing existing worker for camera {}", camera_id);
                 return Ok(worker);
             }
@@ -322,6 +326,10 @@ struct CameraWorkerState {
 pub struct CameraWorker {
     config: CameraConfig,
     latest_frame: watch::Sender<Bytes>,
+    // Keep one receiver alive so that send() succeeds and borrow() reflects the
+    // latest value.  tokio::sync::watch silently discards sent values when all
+    // receivers are dropped.
+    _anchor_rx: watch::Receiver<Bytes>,
     stop: Arc<AtomicBool>,
     frame_count: AtomicU64,
     frame_consumed: Arc<AtomicBool>,
@@ -352,11 +360,12 @@ impl CameraWorker {
             config.capture_encoding
         );
 
-        let (latest_frame, _) = watch::channel(Bytes::new());
+        let (latest_frame, anchor_rx) = watch::channel(Bytes::new());
         let worker = Arc::new(Self {
             adaptive_quality: Arc::new(AtomicBool::new(config.adaptive_quality)),
             config,
             latest_frame,
+            _anchor_rx: anchor_rx,
             stop: Arc::new(AtomicBool::new(false)),
             frame_count: AtomicU64::new(0),
             frame_consumed: Arc::new(AtomicBool::new(true)),
@@ -383,11 +392,12 @@ impl CameraWorker {
     // Static-frame workers are only used by test helpers (register_static_frame).
     // They never enter the capture loop, so cleanup_sender: None is intentional.
     fn from_static_frame(config: CameraConfig, frame: Vec<u8>) -> Self {
-        let (latest_frame, _) = watch::channel(Bytes::from(frame));
+        let (latest_frame, anchor_rx) = watch::channel(Bytes::from(frame));
         Self {
             adaptive_quality: Arc::new(AtomicBool::new(config.adaptive_quality)),
             config,
             latest_frame,
+            _anchor_rx: anchor_rx,
             stop: Arc::new(AtomicBool::new(false)),
             frame_count: AtomicU64::new(1),
             frame_consumed: Arc::new(AtomicBool::new(true)),
@@ -491,11 +501,11 @@ impl CameraWorker {
         let mut had_subscriber = false;
 
         while !self.stop.load(Ordering::Relaxed) {
-            if self.latest_frame.receiver_count() > 0 {
+            if self.latest_frame.receiver_count() > 1 {
                 had_subscriber = true;
             }
 
-            if had_subscriber && self.latest_frame.receiver_count() == 0 {
+            if had_subscriber && self.latest_frame.receiver_count() <= 1 {
                 let idle_start = Instant::now();
                 info!(
                     "Camera {} has no subscribers, starting 30s idle grace period",
@@ -510,7 +520,7 @@ impl CameraWorker {
                         return;
                     }
 
-                    if self.latest_frame.receiver_count() > 0 {
+                    if self.latest_frame.receiver_count() > 1 {
                         had_subscriber = true;
                         debug!(
                             "Camera {} subscriber reconnected during grace period",
@@ -533,7 +543,11 @@ impl CameraWorker {
             }
 
             match self.capture_once() {
-                Ok(()) => {}
+                Ok(saw_subscriber) => {
+                    if saw_subscriber {
+                        had_subscriber = true;
+                    }
+                }
                 Err(error) => {
                     warn!(
                         "Camera {} capture iteration failed: {}",
@@ -548,7 +562,8 @@ impl CameraWorker {
         debug!("Camera {} capture loop stopped", self.config.camera_id);
     }
 
-    fn capture_once(&self) -> Result<(), String> {
+    /// Returns Ok(true) if at least one external subscriber was seen during this capture session.
+    fn capture_once(&self) -> Result<bool, String> {
         self.set_status("opening");
 
         debug!(
@@ -606,8 +621,13 @@ impl CameraWorker {
         let mut consecutive_count: u8 = 0;
         let mut skipped_frames: u64 = 0;
 
+        let mut had_subscriber_inner = false;
+
         while !self.stop.load(Ordering::Relaxed) {
-            if self.latest_frame.receiver_count() == 0 {
+            let has_subscribers = self.latest_frame.receiver_count() > 1;
+            if has_subscribers {
+                had_subscriber_inner = true;
+            } else if had_subscriber_inner {
                 debug!("Camera {} lost all subscribers during streaming, breaking to idle check", self.config.camera_id);
                 break;
             }
@@ -688,7 +708,7 @@ impl CameraWorker {
             self.publish_frame(Bytes::from(jpeg));
         }
 
-        Ok(())
+        Ok(had_subscriber_inner)
     }
 }
 
@@ -798,6 +818,10 @@ fn has_bootstrap(query: &HashMap<String, String>, headers: &HeaderMap) -> bool {
         || ["x-node", "x-resolution", "x-framerate", "x-capture-encoding"]
             .iter()
             .any(|key| headers.contains_key(*key))
+}
+
+fn has_adaptive_quality(query: &HashMap<String, String>, headers: &HeaderMap) -> bool {
+    query.contains_key("adaptive_quality") || headers.contains_key("x-adaptive-quality")
 }
 
 fn now_millis() -> u128 {

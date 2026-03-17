@@ -127,9 +127,12 @@ fn jpeg_response(frame: Bytes) -> Response {
 
 fn mjpeg_stream_response(mut receiver: tokio::sync::watch::Receiver<Bytes>, frame_consumed: Arc<AtomicBool>) -> Response {
     let body_stream = stream! {
+        // Signal readiness so the capture thread produces a fresh frame
+        // (breaks the frame-skip deadlock when no prior subscriber consumed).
+        frame_consumed.store(true, Ordering::Relaxed);
+
         let initial = receiver.borrow().clone();
         if !initial.is_empty() {
-            frame_consumed.store(true, Ordering::Relaxed);
             yield Ok::<Bytes, Infallible>(build_mjpeg_chunk(&initial));
         }
 

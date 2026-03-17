@@ -146,6 +146,21 @@ mod tests {
         assert_ne!(a, b, "framerate change should make configs unequal");
     }
 
+    #[tokio::test]
+    async fn watch_sender_requires_live_receiver_for_borrow_to_reflect_sent_value() {
+        // When all receivers are dropped, send() returns Err and borrow() returns the initial value.
+        // We must keep at least one receiver alive for the publish/borrow pattern to work.
+        let (tx, rx) = tokio::sync::watch::channel(bytes::Bytes::new());
+
+        let payload = bytes::Bytes::from_static(b"test-jpeg-data");
+        let send_result = tx.send(payload.clone());
+        assert!(send_result.is_ok(), "send should succeed with a live receiver");
+
+        let borrowed = tx.borrow().clone();
+        assert_eq!(borrowed, payload, "borrow() must return the sent value");
+        drop(rx);
+    }
+
     #[test]
     fn integer_yuv_to_rgb_matches_reference_output() {
         use crate::manager::yuv_to_rgb;
